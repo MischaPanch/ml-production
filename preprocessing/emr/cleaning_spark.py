@@ -2,8 +2,17 @@ import logging
 import re
 from typing import List, Callable, Union
 
+import pandas as pd
 from pyspark import Row, SparkContext
 from pyspark.sql import functions as f, SparkSession
+
+from models.utils import ColumnGeneratorSentenceEncodings, BertBaseMeanEncodingProvider
+from sensai import InputOutputData
+from sensai.data_transformation import DFTNormalisation
+from sensai.evaluation import evalModelViaEvaluator
+from sensai.featuregen import FeatureGeneratorFromColumnGenerator, ChainedFeatureGenerator, \
+    FeatureGeneratorFlattenColumns, FeatureCollector
+from sensai.torch import models
 
 _log = logging.getLogger(__name__)
 
@@ -95,5 +104,41 @@ if __name__ == "__main__":
 
     cleanGifts = manipulateNestedColumn(gifts, "style", "Gift Amount:", castToInt, newChildColName="Gift_Amount")
 
+    flattenedDf = cleanGifts.select(f.concat_ws("_", "asin", "reviewerID", "unixReviewTime").alias("identifier"),
+                                    "style.*", "overall", "reviewText")
+
+    CACHE_PATH = "s3://<INSERT_PATH>"
+
+    def sentenceEmbeddingFeatureGeneratorFactory():
+        columnGen = ColumnGeneratorSentenceEncodings("reviewText", BertBaseMeanEncodingProvider(),
+                                                     CACHE_PATH, persistCache=True)
+        return FeatureGeneratorFromColumnGenerator(columnGen, unsupported=True)
+
+
+    def computeFeaturesFromRow(row: Row):
+        if not isinstance(row.reviewText, str):
+            return
+        rowDict = row.asDict()
+        rowPandasDf = pd.DataFrame(rowDict, index=[row.identifier])
+        _log.debug(f"Computing entry for {row.identifier}")
+        generator = sentenceEmbeddingFeatureGeneratorFactory()
+        generator.generate(rowPandasDf)
+
+    reviewEncodingFeatureGen = sentenceEmbeddingFeatureGeneratorFactory()
+    encodedReviewColName = reviewEncodingFeatureGen.columnGen.generatedColumnName
+    flattenedSentenceEncodingsFeatureregen = \
+        ChainedFeatureGenerator(sentenceEmbeddingFeatureGeneratorFactory(),
+                                FeatureGeneratorFlattenColumns(encodedReviewColName,
+                                                               normalisationRules=[DFTNormalisation.Rule(fr"{encodedReviewColName}_[0-9]+")]))
+
+    reviewClassifier = models.TorchMultiLayerPerceptronVectorClassificationModel(hiddenDims=[100, 50, 20], cuda=False, epochs=300)
+    reviewFeatureCollector = FeatureCollector(flattenedSentenceEncodingsFeatureregen)
+    reviewClassifier = reviewClassifier.withFeatureCollector(reviewFeatureCollector)
+
+    # flattenedDf.foreach(computeFeaturesFromRow)
+    flattenedPandasDf = flattenedDf.toPandas().set_index("identifier", drop=True).dropna()
+    targetDf = pd.DataFrame(flattenedPandasDf.pop("overall"))
+    inputOutputData = InputOutputData(flattenedPandasDf, targetDf)
+    evalModelViaEvaluator(reviewClassifier, inputOutputData, testFraction=0.01, plotTargetDistribution=True)
 
 
