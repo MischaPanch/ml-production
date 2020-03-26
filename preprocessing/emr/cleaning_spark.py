@@ -96,8 +96,8 @@ def manipulateNestedThroughRdd(df, parentColName, childColName, mapping,
 if __name__ == "__main__":
     sc = SparkContext.getOrCreate()
     spark = SparkSession(sc).builder.master("local").getOrCreate()
-    gifts = spark.read.json("s3://<BUCKET>/raw/Gift_Cards_5.json.gz")
-    logging.basicConfig(level=logging.INFO)
+    gifts = spark.read.json("data/raw/Gift_Cards_5.json.gz")
+    logging.basicConfig(level=logging.DEBUG)
 
     def castToInt(col):
         return f.regexp_replace(col, " ", "").cast("int")
@@ -107,10 +107,11 @@ if __name__ == "__main__":
     flattenedDf = cleanGifts.select(f.concat_ws("_", "asin", "reviewerID", "unixReviewTime").alias("identifier"),
                                     "style.*", "overall", "reviewText")
 
-    CACHE_PATH = "s3://<INSERT_PATH>"
+    CACHE_PATH = "sentenceCache.sqlite"
+    encodingProvider = BertBaseMeanEncodingProvider()
 
     def sentenceEmbeddingFeatureGeneratorFactory():
-        columnGen = ColumnGeneratorSentenceEncodings("reviewText", BertBaseMeanEncodingProvider(),
+        columnGen = ColumnGeneratorSentenceEncodings("reviewText", encodingProvider,
                                                      CACHE_PATH, persistCache=True)
         return FeatureGeneratorFromColumnGenerator(columnGen, unsupported=True)
 
@@ -131,7 +132,7 @@ if __name__ == "__main__":
                                 FeatureGeneratorFlattenColumns(encodedReviewColName,
                                                                normalisationRules=[DFTNormalisation.Rule(fr"{encodedReviewColName}_[0-9]+")]))
 
-    reviewClassifier = models.TorchMultiLayerPerceptronVectorClassificationModel(hiddenDims=[100, 50, 20], cuda=False, epochs=300)
+    reviewClassifier = models.TorchMultiLayerPerceptronVectorClassificationModel(hiddenDims=[50, 50, 20], cuda=False, epochs=300)
     reviewFeatureCollector = FeatureCollector(flattenedSentenceEncodingsFeatureregen)
     reviewClassifier = reviewClassifier.withFeatureCollector(reviewFeatureCollector)
 
