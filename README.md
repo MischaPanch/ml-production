@@ -1,2 +1,2 @@
 # ml-production
-Repository containing tutorials relevant for ML in production environments
+Repository containing tutorials and code snippets relevant for ML in production environments

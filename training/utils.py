@@ -3,9 +3,8 @@ from abc import ABC, abstractmethod
 from typing import Union, List, Generic, TypeVar
 
 import numpy as np
-from sentence_transformers import SentenceTransformer
-
 import sensai as sn
+from textstat import textstat
 
 T = TypeVar("T")
 
@@ -46,12 +45,30 @@ class BertBaseMeanSentenceEncoder(SentenceEncoder):
         return self.embeddingModel.encode([sentence])[0]
 
     def __init__(self):
+        from sentence_transformers import SentenceTransformer
         self.embeddingModel = SentenceTransformer('bert-base-nli-mean-tokens')
 
 
 class BertBaseMeanEncodingProvider(TransientInstanceProvider[BertBaseMeanSentenceEncoder]):
     def _getInstance(self):
         return BertBaseMeanSentenceEncoder()
+
+
+class TextStatEncoder(SentenceEncoder):
+    def encode(self, sentence: str) -> np.ndarray:
+        if not isinstance(sentence, str):
+            sentence = ''
+        return np.array([
+            textstat.flesch_reading_ease(sentence),
+            textstat.syllable_count(sentence),
+            textstat.text_standard(sentence, float_output=True),
+            textstat.syllable_count(sentence),
+            textstat.lexicon_count(sentence, removepunct=True)])
+
+
+class TextStatEncodingProvider(TransientInstanceProvider[TextStatEncoder]):
+    def _getInstance(self):
+        return TextStatEncoder()
 
 
 class ColumnGeneratorSentenceEncodings(sn.columngen.ColumnGeneratorCachedByIndex):

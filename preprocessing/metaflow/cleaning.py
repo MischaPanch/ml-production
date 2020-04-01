@@ -1,10 +1,11 @@
 import os
 
 import pandas as pd
-from metaflow import FlowSpec, step, retry, Parameter, batch, conda_base
+from metaflow import FlowSpec, step, Parameter
 
 
-@conda_base(python="3.7", libraries={'pandas': '1.0.1'})
+# noinspection PyTypeChecker
+# @conda_base(python="3.7", libraries={'pandas': '1.0.1'})
 class JsonCleaningFlow(FlowSpec):
     """
     A flow to clean jsons and persist them in S3
@@ -15,44 +16,33 @@ class JsonCleaningFlow(FlowSpec):
     """
 
     chunksize = Parameter("chunksize", default=int(1e3), help="Maximal number of rows to include into one process")
-    inputFile = Parameter("inputFile", help="file uri to read with pandas",
-                          default="s3://mlproduction-mpanchen/raw/Gift_Cards_5.json.gz")
-    outputDir = Parameter("outputDir",  help="uri of a directory", default="s3://mlproduction-mpanchen/cleaned")
+    inputFile = Parameter("inputFile", help="file uri to read with pandas (local or s3)",
+                          default="data/raw/Gift_Cards_5.json.gz")
+    outputDir = Parameter("outputDir",  help="uri of a directory (local or s3)", default="data/metaflow/cleaned")
 
-    @batch(cpu=1, memory=500)
     @step
     def start(self):
         """
-        Load file from S3
+        Load file (from S3 or local)
         """
-        # with metaflows internal s3 connector:
-        #
-        # with S3(s3root=self.bucket) as s3:
-        #     print("trying to load from s3")
-        #     s3obj = s3.get('raw/Gift_Cards_5.json.gz')
-        #     print("Object found at", s3obj.url)
-        #     self.file = gzip.open(BytesIO(s3obj.blob))
+        self.dataframes = list(pd.read_json(self.inputFile, lines=True, chunksize=self.chunksize))
+        self.next(self.clean_dataframe, foreach="dataframes")
 
-        self.dataframesWithPrefix = list(enumerate(pd.read_json(self.inputFile, lines=True, chunksize=self.chunksize)))
-        self.next(self.clean_dataframe, foreach="dataframesWithPrefix")
-
-    @batch(cpu=1, memory=500)
-    @retry
     @step
     def clean_dataframe(self):
-        """clean"""
-        self.prefix, self.df = self.input
+        """clean the style columns"""
+        self.df: pd.DataFrame = self.input
         self.df["style"] = self.df["style"] \
             .apply(lambda x: {} if pd.isna(x) else x) \
             .apply(lambda x: {k.replace(" ", "_").replace(":", ""): int(v.strip()) for k, v in x.items()})
         self.next(self.save_dataframe)
 
-    @batch(cpu=1, memory=500)
-    @retry
     @step
     def save_dataframe(self):
-        """save"""
-        outputFile = os.path.join(self.outputDir, f"{self.prefix}_{os.path.basename(self.inputFile)}")
+        """save as json"""
+        outputFile = os.path.join(self.outputDir, f"{self.index}_{os.path.basename(self.inputFile)}")
+        if not outputFile.startswith("s3://"):
+            os.makedirs(os.path.dirname(outputFile), exist_ok=True)
         self.df.to_json(outputFile, lines=True, orient="records")
         self.next(self.join)
 

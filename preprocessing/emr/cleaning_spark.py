@@ -1,24 +1,16 @@
 import logging
-import pickle
+import os
 import re
 from typing import List, Callable, Union
 
-import pandas as pd
 from pyspark import Row, SparkContext
 from pyspark.sql import functions as f, SparkSession
-from sensai import InputOutputData
-from sensai.data_transformation import DFTNormalisation
-from sensai.evaluation import evalModelViaEvaluator
-from sensai.featuregen import FeatureGeneratorFromColumnGenerator, FeatureCollector, flattenedFeatureGenerator
-from sensai.torch import models
-
-from models.utils import ColumnGeneratorSentenceEncodings, BertBaseMeanEncodingProvider
 
 _log = logging.getLogger(__name__)
 
 
 def manipulateNestedColumn(df, parentColName, childColName, mapping=None, newChildColName=None, addAsNewChild=False):
-    #TODO: currently only works with exactly once nested columns
+    # TODO: currently only works with exactly once nested columns
 
     def identity(x):
         return x
@@ -61,7 +53,7 @@ def manipulateNestedColumns(df, parentColName: str, childColNames: str, mappings
 
 def manipulateNestedThroughRdd(df, parentColName, childColName, mapping,
         newChildColName=None, addAsNewChild=False, newChildType=None):
-    #TODO: currently only works with exactly once nested columns
+    # TODO: currently only works with exactly once nested columns
     if newChildColName is None and addAsNewChild:
         raise ValueError(f"Cannot add the column {childColName} twice to {parentColName}")
 
@@ -94,59 +86,20 @@ def manipulateNestedThroughRdd(df, parentColName, childColName, mapping,
 
 
 if __name__ == "__main__":
+    # This should be passed through argparse and spark submit in a real scenario
+    INPUT_FILE = "data/raw/Gift_Cards_5.json.gz"
+    OUTPUT_FILE = "data/emr/cleaned/Gift_Cards_5.json.gz"
+
+    logging.basicConfig(level=logging.INFO)
     sc = SparkContext.getOrCreate()
-    spark = SparkSession(sc).builder.master("local").getOrCreate()
-    gifts = spark.read.json("data/raw/Gift_Cards_5.json.gz")
-    logging.basicConfig(level=logging.DEBUG)
+    spark = SparkSession(sc).builder.master("local").enableHiveSupport().getOrCreate()
 
     def castToInt(col):
-        return f.regexp_replace(col, " ", "").cast("int")
+        return f.trim(col).cast("int")
 
+    # read, clean and write
+    gifts = spark.read.json(INPUT_FILE)
     cleanGifts = manipulateNestedColumn(gifts, "style", "Gift Amount:", castToInt, newChildColName="Gift_Amount")
-
-    flattenedDf = cleanGifts.select(f.concat_ws("_", "asin", "reviewerID", "unixReviewTime").alias("identifier"),
-                                    "style.*", "overall", "reviewText")
-    flattenedDf.write.mode("overwrite").csv("flattenedGifts.csv")
-
-    CACHE_PATH = "sentenceCache.sqlite"
-    encodingProvider = BertBaseMeanEncodingProvider()
-
-    def sentenceEmbeddingFeatureGeneratorFactory(persistCache=True):
-        columnGen = ColumnGeneratorSentenceEncodings("reviewText", encodingProvider,
-                                                     CACHE_PATH, persistCache=persistCache)
-        return FeatureGeneratorFromColumnGenerator(columnGen,
-                    normalisationRuleTemplate=DFTNormalisation.RuleTemplate(unsupported=True))
-
-
-    def computeFeaturesFromRow(row: Row):
-        if not isinstance(row.reviewText, str):
-            return
-        rowDict = row.asDict()
-        rowPandasDf = pd.DataFrame(rowDict, index=[row.identifier])
-        print(f"Computing entry for {row.identifier}")
-        generator = sentenceEmbeddingFeatureGeneratorFactory()
-        generator.generate(rowPandasDf)
-
-    flattenedDf.foreach(computeFeaturesFromRow)
-
-    reviewEncodingFeatureGen = sentenceEmbeddingFeatureGeneratorFactory(persistCache=False)
-    encodedReviewColName = reviewEncodingFeatureGen.columnGen.generatedColumnName
-    flattenedSentenceEncodingsFeatureregen = flattenedFeatureGenerator(reviewEncodingFeatureGen,
-                                                    normalisationRuleTemplate=DFTNormalisation.RuleTemplate(skip=True))
-
-    reviewClassifier = models.MultiLayerPerceptronVectorClassificationModel(hiddenDims=[50, 50, 20], cuda=False, epochs=300)
-    reviewFeatureCollector = FeatureCollector(flattenedSentenceEncodingsFeatureregen)
-    reviewClassifier = reviewClassifier.withFeatureCollector(reviewFeatureCollector)
-
-    flattenedPandasDf = flattenedDf.toPandas().set_index("identifier", drop=True).dropna()
-    targetDf = pd.DataFrame(flattenedPandasDf.pop("overall"))
-    inputOutputData = InputOutputData(flattenedPandasDf, targetDf)
-    evalModelViaEvaluator(reviewClassifier, inputOutputData, testFraction=0.01, plotTargetDistribution=True)
-
-    with open("reviewClassifier-v1.pickle", 'wb') as f:
-        pickle.dump(reviewClassifier, f)
-
-    with open("reviewClassifier-v1.pickle", 'rb') as f:
-        loadedModel = pickle.load(f)
-
-    loadedModel.predict(flattenedPandasDf)
+    if not OUTPUT_FILE.startswith("s3://"):
+        os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
+    cleanGifts.write.mode("overwrite").json(OUTPUT_FILE)
